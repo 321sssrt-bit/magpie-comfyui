@@ -1,132 +1,125 @@
-import { execFile } from "node:child_process"
-import { isAbsolute } from "node:path"
-import { workerPath } from "./platforms.js"
-
-const baseURL = "http://comfyui.invalid/v1"
-const binary = workerPath()
-
-// Magpie loads JS plugins; the short-lived Go worker owns the ComfyUI protocol.
-function worker(source, command, request, signal) {
-  return new Promise((resolve, reject) => {
-    signal?.throwIfAborted()
-    const connection = typeof source === "string" ? { config: source } : source
-    const args = []
-    for (const [key, flag] of Object.entries({ config: "-config", server: "-server", token_env: "-token-env", name: "-name" })) {
-      if (connection[key]) args.push(flag, connection[key])
-    }
-    const child = execFile(binary, [...args, command], {
-      signal, maxBuffer: 128 * 1024 * 1024, windowsHide: true,
-    }, (error, stdout, stderr) => {
-      if (error) return reject(new Error(stderr.trim() || error.message, { cause: error }))
-      try { resolve(JSON.parse(stdout)) } catch { reject(new Error("ComfyUI worker returned invalid JSON")) }
-    })
-    child.stdin.on("error", () => {}) // execFile reports early exit or failed spawn.
-    child.stdin.end(request === undefined ? "" : JSON.stringify(request))
-  })
+const object = (value) => value !== null && typeof value === "object" && !Array.isArray(value)
+const segment = (value) => {
+  if (typeof value !== "string" || !value || value === "." || value === ".." || /[/\\\x00\r\n]/.test(value)) {
+    throw new Error("Expected a single model folder, node class or prompt ID")
+  }
+  return encodeURIComponent(value)
 }
-
-function savedConnection(key) {
-  return key.startsWith("{") ? JSON.parse(key) : key
-}
-
-function serverURL(value) {
-  const url = new URL(value || "http://127.0.0.1:8188")
-  if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.search || url.hash) {
+const serverURL = (value) => {
+  let url
+  try { if (typeof value === "string") url = new URL(value) } catch {}
+  if (!url || !["http:", "https:"].includes(url.protocol) || url.username || url.password || url.search || url.hash) {
     throw new Error("Use an HTTP(S) server URL without credentials, query or fragment")
   }
-  return url.href.replace(/\/$/, "")
+  return url.href.replace(/\/+$/, "")
 }
 
-export const ComfyUIPlugin = async () => ({
-  config: async (config) => {
-    config.provider ??= {}
-    config.provider.comfyui = {
-      name: "ComfyUI", npm: "@ai-sdk/openai-compatible", api: baseURL, models: {},
+export const ComfyUIPlugin = async (_input, options = {}) => {
+  const connections = options.connections ?? {}
+  if (!object(connections)) throw new Error("Plugin options.connections must be an object keyed by connection ID")
+
+  const request = async (connection, path, body, ctx, image = false) => {
+    if (typeof connection !== "string" || !Object.hasOwn(connections, connection)) {
+      throw new Error("Choose a connection ID from resources(resource=connections); configure connections with magpie plugin options")
     }
-  },
-  provider: {
-    id: "comfyui",
-    async models(_provider, { auth }) {
-      if (!auth?.key) return {}
-      const source = savedConnection(auth.key)
-      const result = await worker(source, typeof source === "string" ? "catalog" : "inspect")
-      const model = typeof source === "string" ? result : result.workflow
-      if (!model) return {}
-      if (model.issues?.length) throw new Error(model.issues.join("; "))
-      return {
-        [model.id]: {
-          id: model.id, name: model.name, providerID: "comfyui",
-          api: { id: model.id, url: baseURL, npm: "@ai-sdk/openai-compatible" },
-          limit: { context: 0, output: 0 },
-          cost: { input: 0, output: 0 },
-          capabilities: {
-            input: { text: true }, output: { image: true },
-            toolcall: false, reasoning: false, temperature: false,
-          },
-        },
+    const saved = connections[connection]
+    if (!object(saved) || typeof saved.server !== "string") throw new Error("Missing server URL for connection " + connection)
+    const url = serverURL(saved.server)
+    const headers = new Headers()
+    if (body !== undefined) headers.set("Content-Type", "application/json")
+    if (saved.token_env) {
+      if (typeof saved.token_env !== "string" || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(saved.token_env)) throw new Error("token_env must name an environment variable")
+      const token = process.env[saved.token_env]
+      if (!token) throw new Error("token_env is not set in the Magpie process")
+      headers.set("Authorization", "Bearer " + token)
+    }
+    if (saved.user) {
+      if (typeof saved.user !== "string") throw new Error("user must be a ComfyUI user ID")
+      headers.set("Comfy-User", saved.user)
+    }
+    const timeout = AbortSignal.timeout(30_000)
+    const signal = ctx.abort ? AbortSignal.any([ctx.abort, timeout]) : timeout
+    signal.throwIfAborted()
+    try {
+      const response = await fetch(url + path, {
+        method: body === undefined ? "GET" : "POST", headers,
+        body: body === undefined ? undefined : JSON.stringify(body), redirect: "manual", signal,
+      })
+      if (response.status >= 300 && response.status < 400) {
+        await response.body?.cancel()
+        throw new Error("Redirect refused; configure the final server URL")
       }
+      const chunks = []
+      let size = 0
+      if (response.body) for await (const chunk of response.body) {
+        size += chunk.byteLength
+        if (size > 16 * 1024 * 1024) throw new Error("ComfyUI response exceeds 16 MiB")
+        chunks.push(chunk)
+      }
+      const data = Buffer.concat(chunks)
+      if (!response.ok) throw new Error(`ComfyUI HTTP ${response.status}: ${data.toString("utf8", 0, 4096)}`)
+      if (!image) return JSON.parse(data.toString("utf8"))
+      const mime = (response.headers.get("Content-Type") || "").split(";")[0].trim()
+      if (!mime.startsWith("image/")) throw new Error("ComfyUI /view did not return an image")
+      return { mime_type: mime, base64: data.toString("base64") }
+    } catch (error) {
+      if (body !== undefined) throw new Error("Submission was not confirmed; check ComfyUI queue/history before retrying. " + error.message, { cause: error })
+      throw error
+    }
+  }
+  const tool = (description, properties, required, execute) => ({
+    description,
+    args: { type: "object", properties: {
+      connection: { type: "string", description: "Configured connection ID. Keep the same ID for submit, history and view." },
+      ...properties,
+    }, required, additionalProperties: false },
+    execute: async (args, ctx) => {
+      ctx.abort?.throwIfAborted()
+      const result = await execute(args, ctx)
+      // Magpie transports tool results as one JSON line with a 32 MiB limit.
+      if (Buffer.byteLength(JSON.stringify({ result: { text: JSON.stringify(result) } })) > 31 * 1024 * 1024) {
+        throw new Error("ComfyUI result exceeds Magpie's tool message limit")
+      }
+      return result
     },
-  },
-  auth: {
-    provider: "comfyui",
-    methods: [{
-      type: "api", label: "ComfyUI workflow configuration", keyless: true,
-      prompts: [{
-        type: "text", key: "config", message: "Absolute path to your ComfyUI configuration JSON",
-        validate: (value) => isAbsolute(value || "") ? undefined : "Use an absolute file path",
-      }],
-      async authorize(inputs) {
-        if (!isAbsolute(inputs?.config || "")) throw new Error("Use an absolute configuration path")
-        await worker(inputs.config, "catalog")
-        return { type: "success", key: inputs.config }
-      },
-    }, {
-      type: "api", label: "Connect ComfyUI server and discover resources", keyless: true,
-      prompts: [
-        {
-          type: "text", key: "server", message: "ComfyUI server URL (blank: http://127.0.0.1:8188)",
-          validate(value) { try { serverURL(value); return undefined } catch { return "Use an HTTP(S) server URL" } },
-        },
-        { type: "text", key: "name", message: "Connection name (optional)" },
-        {
-          type: "text", key: "token_env", message: "Bearer token environment variable name (optional; not the token itself)",
-          validate: (value) => !value || /^[A-Za-z_][A-Za-z0-9_]*$/.test(value) ? undefined : "Use an environment variable name",
-        },
-        {
-          type: "text", key: "config", message: "Existing workflow configuration path (optional; blank connects for resource inspection only)",
-          validate: (value) => !value || isAbsolute(value) ? undefined : "Use an absolute file path",
-        },
-      ],
-      async authorize(inputs = {}) {
-        if (inputs.config && !isAbsolute(inputs.config)) throw new Error("Use an absolute configuration path")
-        if (inputs.token_env && !/^[A-Za-z_][A-Za-z0-9_]*$/.test(inputs.token_env)) throw new Error("Use an environment variable name")
-        const source = { server: serverURL(inputs.server), name: inputs.name || "", token_env: inputs.token_env || "", config: inputs.config || "" }
-        const inventory = await worker(source, "inspect")
-        if (inventory.workflow?.issues.length) throw new Error(inventory.workflow.issues.join("; "))
-        source.server = inventory.base_url
-        source.name = inventory.name
-        return {
-          type: "success", key: JSON.stringify(source),
-          // Magpie displays API account identity through metadata.email.
-          metadata: { email: `${source.name} (${source.server})${source.config ? " · " + source.config : ""}` },
+  })
+  return { tool: {
+    resources: tool("List configured connections, or read ComfyUI's live models, node definitions, system stats or queue. Use real files and object_info schemas to author a native API graph.", {
+      resource: { type: "string", enum: ["connections", "models", "object_info", "system_stats", "queue"] },
+      name: { type: "string", description: "Optional model folder or node class." },
+    }, ["resource"], async ({ resource, connection, name }, ctx) => {
+      if (resource === "connections") return Object.entries(connections).map(([id, value]) => {
+        try { return { id, server: serverURL(value?.server) } } catch { return { id, server: null } }
+      })
+      if (!["models", "object_info", "system_stats", "queue"].includes(resource)) throw new Error("Unknown resource")
+      if (name !== undefined && !["models", "object_info"].includes(resource)) throw new Error("name applies only to models or object_info")
+      return request(connection, "/" + resource + (name === undefined ? "" : "/" + segment(name)), undefined, ctx)
+    }),
+    submit: tool("Submit a native ComfyUI API graph once and receive prompt_id. Poll history with the same connection. Never resubmit merely because a call timed out.", {
+      prompt: { type: "object", description: "Native node-ID map of class_type and inputs, not editor canvas JSON." },
+      partial_execution_targets: { type: "array", items: { type: "string" }, minItems: 1 },
+    }, ["connection", "prompt"], async ({ connection, prompt, partial_execution_targets }, ctx) => {
+      if (!object(prompt) || !Object.keys(prompt).length || Object.values(prompt).some((node) => !object(node) || typeof node.class_type !== "string" || !node.class_type || !object(node.inputs))) {
+        throw new Error("prompt must be a native API graph; each node needs class_type and inputs")
+      }
+      const body = { prompt }
+      if (partial_execution_targets !== undefined) {
+        if (!Array.isArray(partial_execution_targets) || !partial_execution_targets.length || partial_execution_targets.some((id) => typeof id !== "string" || !Object.hasOwn(prompt, id))) {
+          throw new Error("partial_execution_targets must contain existing node IDs")
         }
-      },
-    }],
-    async loader(getAuth) {
-      return {
-        apiKey: "comfyui-local", baseURL,
-        async fetch(url, init = {}) {
-          const { key } = await getAuth()
-          if (!key) throw new Error("Connect a ComfyUI workflow configuration first")
-          const result = await worker(savedConnection(key), "request", {
-            method: init.method || "POST", path: new URL(url).pathname,
-            body: typeof init.body === "string" ? init.body : "",
-          }, init.signal)
-          return new Response(JSON.stringify(result.body), {
-            status: result.status, headers: { "Content-Type": "application/json" },
-          })
-        },
+        body.partial_execution_targets = partial_execution_targets
       }
-    },
-  },
-})
+      return request(connection, "/prompt", body, ctx)
+    }),
+    history: tool("Read /history/{prompt_id} on the connection used to submit. An empty object means no history yet. Completed outputs contain image locations for view.", {
+      prompt_id: { type: "string" },
+    }, ["connection", "prompt_id"], async ({ connection, prompt_id }, ctx) => request(connection, "/history/" + segment(prompt_id), undefined, ctx)),
+    view: tool("Retrieve an image using the exact filename, subfolder and type from history. Returns original mime_type and base64 bytes, without resizing or conversion.", {
+      filename: { type: "string" }, subfolder: { type: "string" },
+      type: { type: "string", enum: ["output", "temp", "input"], default: "output" },
+    }, ["connection", "filename"], async ({ connection, filename, subfolder = "", type = "output" }, ctx) => {
+      if (typeof filename !== "string" || !filename || typeof subfolder !== "string" || !["output", "temp", "input"].includes(type)) throw new Error("Use the filename, subfolder and type from history")
+      return request(connection, "/view?" + new URLSearchParams({ filename, subfolder, type }), undefined, ctx, true)
+    }),
+  } }
+}

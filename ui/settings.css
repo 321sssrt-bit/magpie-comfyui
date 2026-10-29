@@ -1,0 +1,18 @@
+html, body { background: transparent; }
+body { padding: 12px; }
+fieldset { border: 0; padding: 0; margin: 0; min-width: 0; }
+legend { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+.connection { margin: 12px 0; padding: 10px 12px; border: 1px solid var(--magpie-line); border-radius: 8px; }
+summary { cursor: pointer; overflow-wrap: anywhere; }
+.address { margin-left: 12px; font-size: 12px; }
+.fields { display: grid; grid-template-columns: 1fr 2fr; gap: 10px; margin: 12px 0; }
+label { display: grid; gap: 5px; min-width: 0; }
+input { width: 100%; box-sizing: border-box; }
+.auth { margin: 10px 0; }
+.actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+#save { margin-left: auto; }
+#status { margin: 8px 0 0; overflow-wrap: anywhere; }
+@media (max-width: 480px) {
+  .fields { grid-template-columns: 1fr; }
+  .address { display: block; margin-left: 16px; }
+}

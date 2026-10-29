@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ComfyUI</title>
+  <link rel="stylesheet" href="settings.css">
+  <script src="_magpie/bridge.js"></script>
+  <script src="settings.js" defer></script>
+</head>
+<body>
+  <fieldset id="editor" disabled>
+    <legend id="heading">ComfyUI 连接</legend>
+    <p id="hint" class="muted"></p>
+    <p id="empty" class="muted" hidden></p>
+    <div id="connections"></div>
+    <div class="actions">
+      <button type="button" id="add">添加连接</button>
+      <button type="button" id="reset" disabled>取消更改</button>
+      <button type="button" id="save" disabled>保存</button>
+    </div>
+  </fieldset>
+  <p id="status" role="status" aria-live="polite"></p>
+  <template id="connection">
+    <details class="connection">
+      <summary><strong></strong><span class="address muted"></span></summary>
+      <div class="fields">
+        <label><span data-label="id"></span><input data-field="id" required autocomplete="off" spellcheck="false"></label>
+        <label><span data-label="server"></span><input data-field="server" type="url" required placeholder="http://comfy.example.com:8188" autocomplete="off" spellcheck="false"></label>
+      </div>
+      <details class="auth">
+        <summary data-label="auth"></summary>
+        <div class="fields">
+          <label><span data-label="token_env"></span><input data-field="token_env" pattern="[A-Za-z_][A-Za-z0-9_]*" placeholder="COMFY_TOKEN" autocomplete="off" spellcheck="false"></label>
+          <label><span data-label="user"></span><input data-field="user" autocomplete="off" spellcheck="false"></label>
+        </div>
+      </details>
+      <button type="button" class="remove" data-label="remove"></button>
+    </details>
+  </template>
+</body>
+</html>

@@ -1,92 +1,78 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { fileURLToPath } from "node:url"
-import { createServer } from "node:http"
-import { readFile } from "node:fs/promises"
 import { ComfyUIPlugin } from "./index.js"
 
-const config = fileURLToPath(new URL("./examples/config.json", import.meta.url))
+const ctx = { abort: new AbortController().signal }
 
-test("real Go worker registers an image provider and validates configuration", async () => {
-  const plugin = await ComfyUIPlugin()
-  const cfg = {}
-  await plugin.config(cfg)
-  assert.equal(cfg.provider.comfyui.npm, "@ai-sdk/openai-compatible")
-  const auth = await plugin.auth.methods[0].authorize({ config })
-  assert.equal(auth.key, config)
-  const models = await plugin.provider.models({}, { auth })
-  assert.equal(models.sdxl.capabilities.output.image, true)
-  assert.equal(models.sdxl.api.id, "sdxl")
-  await assert.rejects(plugin.auth.methods[0].authorize({ config: "/missing/config.json" }))
-  await assert.rejects(plugin.auth.methods[0].authorize({ config: "relative.json" }))
-})
-
-test("unsupported operations return structured errors without contacting ComfyUI", async () => {
-  const plugin = await ComfyUIPlugin()
-  const loader = await plugin.auth.loader(async () => ({ key: config }))
-  for (const path of ["/v1/chat/completions", "/v1/images/edits"]) {
-    const res = await loader.fetch("http://comfyui.invalid" + path, { method: "POST", body: "{}" })
-    assert.equal(res.status, 400)
-    assert.match((await res.json()).error.message, /only POST/)
+test("stock tool context keeps connections and native requests separate", async (t) => {
+  const requests = []
+  const png = Buffer.from("89504e470d0a1a0a", "hex")
+  t.mock.method(globalThis, "fetch", async (url, init) => {
+    requests.push({ url, init })
+    return url.includes("/view?")
+      ? new Response(png, { headers: { "Content-Type": "image/png" } })
+      : Response.json({ prompt_id: "job" })
+  })
+  const previous = process.env.COMFY_TEST_TOKEN
+  process.env.COMFY_TEST_TOKEN = "fixture"
+  t.after(() => { if (previous === undefined) delete process.env.COMFY_TEST_TOKEN; else process.env.COMFY_TEST_TOKEN = previous })
+  const plugin = await ComfyUIPlugin({}, { connections: {
+    broken: { server: "not a URL" },
+    one: { server: "http://first:8188" },
+    two: { server: "http://second:8188/prefix", user: "second-user", token_env: "COMFY_TEST_TOKEN" },
+  } })
+  assert.deepEqual(Object.keys(plugin), ["tool"])
+  assert.deepEqual(Object.keys(plugin.tool), ["resources", "submit", "history", "view"])
+  const connections = await plugin.tool.resources.execute({ resource: "connections" }, ctx)
+  assert.deepEqual(connections, [
+    { id: "broken", server: null }, { id: "one", server: "http://first:8188" },
+    { id: "two", server: "http://second:8188/prefix" },
+  ])
+  const prompt = { "7": { class_type: "SaveImage", inputs: { images: ["6", 0] } } }
+  const receipt = await plugin.tool.submit.execute({ connection: "two", prompt, partial_execution_targets: ["7"] }, ctx)
+  assert.equal(receipt.prompt_id, "job")
+  assert.equal(requests[0].url, "http://second:8188/prefix/prompt")
+  assert.equal(requests[0].init.headers.get("Comfy-User"), "second-user")
+  assert.equal(requests[0].init.headers.get("Authorization"), "Bearer fixture")
+  assert.deepEqual(JSON.parse(requests[0].init.body), { prompt, partial_execution_targets: ["7"] })
+  await plugin.tool.history.execute({ connection: "two", prompt_id: "job" }, ctx)
+  await plugin.tool.resources.execute({ connection: "one", resource: "object_info", name: "SaveImage" }, ctx)
+  const result = await plugin.tool.view.execute({ connection: "two", filename: "one + two.png", subfolder: "a/b" }, ctx)
+  assert.deepEqual(result, { mime_type: "image/png", base64: png.toString("base64") })
+  assert.equal(new URL(requests[3].url).searchParams.get("filename"), "one + two.png")
+  assert.equal(new URL(requests[3].url).searchParams.get("subfolder"), "a/b")
+  assert.equal(requests[1].url, "http://second:8188/prefix/history/job")
+  assert.equal(requests[2].url, "http://first:8188/object_info/SaveImage")
+  assert.equal(requests[2].init.headers.has("Authorization"), false)
+  for (const connection of [undefined, "missing", "broken", "toString"]) {
+    await assert.rejects(plugin.tool.history.execute({ connection, prompt_id: "job" }, ctx))
   }
-  const res = await loader.fetch("http://comfyui.invalid/v1/images/generations", {
-    method: "POST", body: '{"model":"sdxl","prompt":"x","quality":"high"}',
-  })
-  assert.equal(res.status, 400)
+  await assert.rejects(plugin.tool.submit.execute({ connection: "one", prompt: { nodes: [] } }, ctx))
+  await assert.rejects(plugin.tool.history.execute({ connection: "one", prompt_id: ".." }, ctx))
+  await assert.rejects(plugin.tool.resources.execute({ connection: "one", resource: "interrupt" }, ctx))
+  await assert.rejects(plugin.tool.history.execute({ connection: "one", prompt_id: "job" }, { abort: AbortSignal.abort() }))
+  assert.equal(requests.length, 4)
 })
 
-test("an already cancelled request never starts generation", async () => {
-  const plugin = await ComfyUIPlugin()
-  const loader = await plugin.auth.loader(async () => ({ key: config }))
-  const signal = AbortSignal.abort()
-  await assert.rejects(loader.fetch("http://comfyui.invalid/v1/images/generations", {
-    method: "POST", body: '{"model":"sdxl","prompt":"x"}', signal,
-  }))
-})
-
-test("server login checks live resources, keeps instances separate, and requires a workflow for generation", async (t) => {
-  const graph = JSON.parse(await readFile(new URL("./examples/sdxl.json", import.meta.url), "utf8"))
-  const nodes = Object.fromEntries(Object.values(graph).map(node => [node.class_type, { input: { required: {} } }]))
-  nodes.CheckpointLoaderSimple.input.required.ckpt_name = [["sd_xl_base_1.0.safetensors"]]
-  const replies = {
-    "/system_stats": { system: { comfyui_version: "0.36.0" } },
-    "/object_info": nodes,
-    "/models": ["checkpoints", "loras"],
-    "/models/checkpoints": ["sd_xl_base_1.0.safetensors"],
-    "/models/loras": ["style.safetensors"],
-    "/queue": { queue_running: [], queue_pending: [] },
-  }
-  let requests = 0
-  const server = createServer((req, res) => {
-    requests++
-    assert.equal(req.method, "GET")
-    assert.ok(Object.hasOwn(replies, req.url))
-    res.setHeader("Content-Type", "application/json")
-    res.end(JSON.stringify(replies[req.url]))
+test("redirects, uncertain submits and oversized replies stay within the plugin", async (t) => {
+  const plugin = await ComfyUIPlugin({}, { connections: { one: { server: "http://first:8188" } } })
+  let reply = () => new Response(null, { status: 307, headers: { Location: "http://other:8188" } })
+  let calls = 0, cancelled = false
+  t.mock.method(globalThis, "fetch", async (_url, init) => {
+    calls++
+    assert.equal(init.redirect, "manual")
+    return reply()
   })
-  await new Promise(resolve => server.listen(0, "127.0.0.1", resolve))
-  t.after(() => new Promise(resolve => server.close(resolve)))
-  const url = `http://127.0.0.1:${server.address().port}`
-  const plugin = await ComfyUIPlugin()
-  const method = plugin.auth.methods[1]
-  const auth = await method.authorize({ server: url, name: "GPU A" })
-  assert.ok(requests > 0)
-  assert.equal(JSON.parse(auth.key).server, url)
-  assert.match(auth.metadata.email, /GPU A/)
-  assert.deepEqual(await plugin.provider.models({}, { auth }), {})
-  const loader = await plugin.auth.loader(async () => auth)
-  const before = requests
-  const response = await loader.fetch("http://comfyui.invalid/v1/images/generations", {
-    method: "POST", body: '{"model":"sdxl","prompt":"audit"}',
-  })
-  assert.equal(response.status, 404)
-  assert.match((await response.json()).error.message, /model not available.*workflow configuration/)
-  assert.equal(requests, before)
-  const configured = await method.authorize({ server: url, name: "GPU B", config })
-  assert.notEqual(configured.key, auth.key)
-  assert.equal((await plugin.provider.models({}, { auth: configured })).sdxl.name, "GPU B")
-  nodes.CheckpointLoaderSimple.input.required.ckpt_name = [[]]
-  await assert.rejects(method.authorize({ server: url, config }), /not available/)
-  replies["/system_stats"] = {}
-  await assert.rejects(method.authorize({ server: url }), /ComfyUI version/)
+  await assert.rejects(plugin.tool.resources.execute({ connection: "one", resource: "models" }, ctx), /Redirect refused/)
+  reply = () => { throw new Error("connection lost") }
+  await assert.rejects(plugin.tool.submit.execute({ connection: "one", prompt: { "1": { class_type: "SaveImage", inputs: {} } } }, ctx), /check ComfyUI queue\/history before retrying/)
+  assert.equal(calls, 2, "a failed submission is not retried")
+  reply = () => new Response(new ReadableStream({
+    pull(controller) { controller.enqueue(new Uint8Array(1024 * 1024)) },
+    cancel() { cancelled = true },
+  }), { headers: { "Content-Type": "image/png" } })
+  await assert.rejects(plugin.tool.view.execute({ connection: "one", filename: "large.png" }, ctx), /exceeds 16 MiB/)
+  assert.equal(cancelled, true)
+  reply = () => Response.json('"'.repeat(8 * 1024 * 1024 - 2))
+  await assert.rejects(plugin.tool.resources.execute({ connection: "one", resource: "models" }, ctx), /tool message limit/)
 })
